@@ -327,12 +327,13 @@ _PROD_FEATURES = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 @pytest.mark.parametrize("name, feats", _PROD_FEATURES, ids=[f[0] for f in _PROD_FEATURES])
 def test_flce_production_vocab_matches_triton(name, feats, dtype):
-    """V=32000 (llama vocab), H=2048 -> many chunks + the PARTIAL last CE tile.
+    """V=32000 (llama vocab), H=2048, BT=1269 (NOT a multiple of BLOCK_M).
 
-    V=32000 is the only vocab here whose per-row column count (num_vec) is NOT a multiple of the
-    CE kernel's 256-thread tile grid, so it is what actually exercises the tail-predication path;
-    V=4096 (used everywhere above) divides evenly and never predicates a thread off. Also
-    production scale (H=2048 -> inc_factor 16 -> many grad-accumulation chunks)."""
+    Two routings in one test: bf16 fires the fused fast path (exercising the M-tail: TMA
+    zero-fill + target/output padding to BLOCK_M for the ragged last token tile), while fp32
+    falls back to the chunked CE path (whose 256-thread V-tail is exercised because V=32000's
+    per-row column count is not a multiple of the CE tile grid). Production scale (H=2048 ->
+    inc_factor 16 -> many grad-accumulation chunks)."""
     set_seed()
     BT, H, V = 1269, 2048, 32000
     opts = dict(feats)
@@ -341,6 +342,55 @@ def test_flce_production_vocab_matches_triton(name, feats, dtype):
     masters = _Masters(BT, H, V, bias=True, ce_weight=use_weight)
     target = _make_target(BT, V, ignore_frac=ignore_frac)
     _assert_flce_parity(masters, target, dtype, reduction="mean", **opts)
+
+
+@cuda_required
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("name, feats", _PROD_FEATURES, ids=[f[0] for f in _PROD_FEATURES])
+def test_flce_fused_features_matches_triton(name, feats, reduction, dtype):
+    """Feature parity on the FUSED fast path. Unlike test_flce_production_vocab (BT=1269, which
+    routes to the chunked CE path), BT=512 is a multiple of BLOCK_M and H a multiple of BLOCK_K,
+    so bf16/fp16 fires the fully-fused forward kernel + the feature-correct chunked backward
+    (softcap / z_loss / class-weight / weighted+unweighted label smoothing folded in). This is the
+    only coverage of the fused feature backward."""
+    set_seed()
+    BT, H, V = 512, 512, 4096
+    opts = dict(feats)
+    use_weight = opts.pop("ce_weight_", False)
+    ignore_frac = opts.pop("ignore_frac", 0.0)
+    masters = _Masters(BT, H, V, bias=True, ce_weight=use_weight)
+    target = _make_target(BT, V, ignore_frac=ignore_frac)
+    _assert_flce_parity(masters, target, dtype, reduction=reduction, **opts)
+
+
+@cuda_required
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("BT", [129, 640, 1269], ids=["BT129", "BT640", "BT1269"])
+def test_flce_fused_m_tail_matches_triton(dtype, BT):
+    """BT NOT a multiple of BLOCK_M (128) must still fire the fused fast path (the ragged last
+    token tile is handled by TMA zero-fill of the OOB X rows + target/output padding to BLOCK_M,
+    sliced off before the loss combine). Asserts the fused path is actually selected (guards
+    against a silent regression back to the chunked fallback), then checks full fwd+bwd parity
+    vs Triton with the 'all' feature set."""
+    from liger_kernel.ops.cutedsl.ops.fused_linear_cross_entropy import _fused_fwd_supported
+
+    set_seed()
+    H, V = 512, 4096
+    probe = torch.empty(BT, H, device="cuda", dtype=dtype)
+    assert _fused_fwd_supported(probe, probe.new_empty(V, H)), "expected the fused path for arbitrary BT"
+    masters = _Masters(BT, H, V, bias=True, ce_weight=True)
+    target = _make_target(BT, V, ignore_frac=0.25)
+    _assert_flce_parity(
+        masters,
+        target,
+        dtype,
+        reduction="mean",
+        label_smoothing=0.1,
+        lse_square_scale=1e-4,
+        softcap=30.0,
+        return_z_loss=True,
+    )
 
 
 # =============================================================================
