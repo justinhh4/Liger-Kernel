@@ -10,6 +10,7 @@ from liger_kernel.ops.utils import compare_version
 from liger_kernel.ops.utils import element_mul_kernel
 from liger_kernel.ops.utils import is_hip
 from liger_kernel.utils import infer_device
+from liger_kernel.utils import infer_device_arch
 from liger_kernel.utils import is_npu_available
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
@@ -215,8 +216,6 @@ def liger_cross_entropy_kernel(
                 X_block += 2 * lse_square_scale * lse * X_block
                 # smoothing term
                 X_block += -eps
-                # special handle dx_y
-                X_block = tl.where(X_offsets != y, X_block, X_block - (1 - label_smoothing))
                 # reduction scale
                 if reduction == "mean":
                     X_block = X_block / n_non_ignore
@@ -225,8 +224,6 @@ def liger_cross_entropy_kernel(
                 softmax_X = tl.exp2((X_block - m) * LOG2_E) / d
                 # derivative of original_loss
                 dloss_ori = (1 - label_smoothing) * softmax_X
-                # specially handle dx_y
-                dloss_ori = tl.where(X_offsets != y, dloss_ori, dloss_ori - (1 - label_smoothing))
                 dloss_ori = dloss_ori * weight_y
                 # derivative of smooth_loss
                 dloss_smooth = eps * (-weight_block + softmax_X * weight_sum)
@@ -247,6 +244,22 @@ def liger_cross_entropy_kernel(
                 X_block = X_block * (1 - intermediate * intermediate)
 
             tl.store(X_ptr + X_offsets, X_block, mask=X_offsets < n_cols)
+
+        # dx_y correction: apply the -(1 - label_smoothing) term once at index y
+        # (replaces the per-element tl.where removed above). Barrier first so the loop's
+        # in-place store to X[y] is visible before we read it back.
+        tl.debug_barrier()
+        dxy = -(1 - label_smoothing)
+        if HAS_WEIGHT:
+            dxy = dxy * weight_y
+            if reduction == "mean":
+                dxy = dxy / sum_non_ignore_weight
+        elif reduction == "mean":
+            dxy = dxy / n_non_ignore
+        if HAS_SOFTCAPPING:
+            t_y = ori_X_y / softcap
+            dxy = dxy * (1 - t_y * t_y)
+        tl.store(X_ptr + y, tl.load(X_ptr + y) + dxy)
 
     # We need tl.debug_barrier() to ensure the new result of X_ptr is written as mentioned in
     # https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/ops/cross_entropy.py#L34
@@ -375,6 +388,19 @@ def cross_entropy_forward(
     if target.stride(-1) != 1:
         target = target.contiguous()
 
+    # num_warps is dtype- and arch-dependent (measured on CE, full fwd+bwd):
+    #   Blackwell (B200, sm_100+) bf16/fp16 -> 8 (instruction-issue-bound); fp32 -> 32
+    #   Hopper (H100, sm_90) and earlier    -> 32 for all dtypes (bandwidth-bound)
+    #   AMD (ROCm)                          -> 16
+    # infer_device_arch() reports Blackwell parts as "blackwell" (sm_100),
+    # "blackwell_ultra" (sm_103), or "blackwell_consumer" (sm_120), so gate on the
+    # "blackwell" prefix to cover the whole generation (sm_100+).
+    if is_hip():
+        ce_num_warps = 16
+    else:
+        is_blackwell = infer_device_arch().startswith("blackwell")
+        ce_num_warps = 8 if (_input.element_size() == 2 and is_blackwell) else 32
+
     # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
     liger_cross_entropy_kernel[(n_rows,)](
         X_ptr=_input,
@@ -409,9 +435,7 @@ def cross_entropy_forward(
         HAS_WEIGHT=True if weight is not None else False,
         HAS_SOFTCAPPING=True if softcap is not None else False,
         HAS_GRADIENTS=_input.requires_grad,
-        # TODO: 32 seems to give the best performance
-        # Performance is quite sensitive to num_warps
-        num_warps=32 if not is_hip() else 16,
+        num_warps=ce_num_warps,
     )
 
     if reduction == "none":
