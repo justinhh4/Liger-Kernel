@@ -5,6 +5,8 @@ Public API:
         LayerNormBuilder protocol.
     LigerMegatronCrossEntropy — drop-in for Megatron-LM's vocab-parallel
         cross-entropy (Megatron defaults). Supports all TP sizes.
+    LigerMegatronFusedLinearCrossEntropy — hidden-state-to-loss fused output
+        projection for tensor-parallel vocabulary shards.
     apply_liger_kernel_to_megatron — patches Megatron-Core so existing training
         scripts pick up Liger kernels with one line. Currently supports
         RMSNorm (via BackendSpecProvider) plus both the fused and unfused
@@ -18,11 +20,13 @@ the general-purpose (non-Megatron-default) variant.
 """
 
 from liger_kernel.megatron.cross_entropy import LigerMegatronCrossEntropy
+from liger_kernel.megatron.fused_linear_cross_entropy import LigerMegatronFusedLinearCrossEntropy
 from liger_kernel.megatron.monkey_patch import apply_liger_kernel_to_megatron
 from liger_kernel.megatron.rms_norm import LigerMegatronRMSNorm
 
 __all__ = [
     "LigerMegatronCrossEntropy",
+    "LigerMegatronFusedLinearCrossEntropy",
     "LigerMegatronRMSNorm",
     "apply_liger_kernel_to_megatron",
 ]
