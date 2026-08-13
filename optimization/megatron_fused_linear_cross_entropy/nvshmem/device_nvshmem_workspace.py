@@ -69,6 +69,7 @@ class DeviceNvshmemReductionWorkspace:
         self._bridge = _load_bridge()
         self._pointers = []
         self._owners = []
+        self.allocated_bytes = 0
         self._epoch = 0
         self._closed = False
 
@@ -100,9 +101,7 @@ class DeviceNvshmemReductionWorkspace:
         # overwrite and allgather those chunks in the source allocation.
         self._inplace_dx = self.hidden_size % 8 == 0 and self.world_size <= 16
         self.dx_destination = (
-            self.dx_source
-            if self._inplace_dx
-            else self._allocate((self.max_tokens, self.hidden_size), self.dx_dtype)
+            self.dx_source if self._inplace_dx else self._allocate((self.max_tokens, self.hidden_size), self.dx_dtype)
         )
         self._signals = self._allocate_raw(self.world_size * ctypes.sizeof(ctypes.c_uint64))
         stream = torch.cuda.current_stream(self.device)
@@ -122,6 +121,7 @@ class DeviceNvshmemReductionWorkspace:
         if not pointer:
             raise RuntimeError("nvshmem_malloc returned null")
         self._pointers.append(pointer)
+        self.allocated_bytes += size
         return pointer
 
     def _allocate(self, shape, dtype):

@@ -10,68 +10,66 @@ from __future__ import annotations
 
 import operator
 
+import cutlass
+import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
+import torch.nn.functional as F
 
+from optimization.megatron_fused_linear_cross_entropy.nvshmem.cutedsl_vocab_parallel_cross_entropy import (
+    backward as cutedsl_ce_backward,
+)
+from optimization.megatron_fused_linear_cross_entropy.nvshmem.cutedsl_vocab_parallel_cross_entropy import (
+    forward as cutedsl_ce_forward,
+)
+from optimization.megatron_fused_linear_cross_entropy.nvshmem.cutedsl_vocab_parallel_cross_entropy import (
+    loss as cutedsl_ce_loss,
+)
+from optimization.megatron_fused_linear_cross_entropy.nvshmem.cutedsl_vocab_parallel_cross_entropy import (
+    row_max as cutedsl_row_max,
+)
+
+from liger_kernel.ops.cutedsl.ops._sm100_gemm import K_ALIGNMENT
+from liger_kernel.ops.cutedsl.ops._sm100_gemm import run_epilogue_gemm
 from liger_kernel.ops.utils import compare_version
 
+_GEMM_ROW_CHUNK_SIZE = 4096
 _SUPPORTS_OUT_DTYPE = compare_version("torch", operator.ge, "2.8.0")
 
 
-def _cutile_dx_out(a: torch.Tensor, b: torch.Tensor, output: torch.Tensor) -> None:
-    import cuda.tile as ct
+@cute.jit
+def _identity_epilogue(accumulator, output):
+    output_dtype = output.element_type
+    for element in cutlass.range_constexpr(cute.size(accumulator)):
+        output[element] = accumulator[element].to(output_dtype)
 
-    from liger_kernel.ops.cutile.ops.megatron_fused_linear_cross_entropy import _matmul_1cta_kernel
-    from liger_kernel.ops.cutile.ops.megatron_fused_linear_cross_entropy import _matmul_2cta_kernel
 
-    if a.shape[0] <= 1024:
-        kernel, tile = _matmul_1cta_kernel, (128, 128, 64)
-    elif a.shape[1] > 16000 or a.shape[0] > 16384:
-        kernel, tile = _matmul_2cta_kernel, (512, 256, 64)
-    else:
-        kernel, tile = _matmul_1cta_kernel, (256, 256, 64)
-    tile_m, tile_n, tile_k = tile
-    grid = (
-        ct.cdiv(a.shape[0], tile_m) * ct.cdiv(b.shape[1], tile_n),
-        1,
-        1,
-    )
-    ct.launch(
-        torch.cuda.current_stream(),
-        grid,
-        kernel,
-        (
-            a,
+def _cutedsl_gemm(a: torch.Tensor, b: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
+    padding = (-a.shape[1]) % K_ALIGNMENT
+    if padding:
+        a = F.pad(a, (0, padding))
+        b = F.pad(b, (0, padding))
+    if output is None:
+        output = torch.empty(a.shape[0], b.shape[0], device=a.device, dtype=a.dtype)
+    for row_start in range(0, a.shape[0], _GEMM_ROW_CHUNK_SIZE):
+        row_end = min(row_start + _GEMM_ROW_CHUNK_SIZE, a.shape[0])
+        run_epilogue_gemm(
+            a[row_start:row_end],
             b,
-            output,
-            output,
-            tile_m,
-            tile_n,
-            tile_k,
-            False,
-            False,
-        ),
-    )
+            output[row_start:row_end],
+            _identity_epilogue,
+            swizzle_size=1,
+        )
+    return output
 
 
-@triton.jit
-def _local_logits_max_kernel(
-    logits_ptr,
-    logits_stride,
-    output_ptr,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    values = tl.load(
-        logits_ptr + row * logits_stride + offsets,
-        mask=offsets < n_cols,
-        other=-float("inf"),
-    ).to(tl.float32)
-    tl.store(output_ptr + row, tl.max(values, axis=0))
+def _matmul_out(a: torch.Tensor, b: torch.Tensor, output: torch.Tensor) -> None:
+    if output.dtype == a.dtype:
+        torch.mm(a, b, out=output)
+    elif _SUPPORTS_OUT_DTYPE:
+        torch.mm(a, b, out=output, out_dtype=output.dtype)
+    else:
+        output.copy_(a.float() @ b.float())
 
 
 def _tp_rank_and_world(tp_group) -> tuple[int, int]:
@@ -85,26 +83,15 @@ def _tp_rank_and_world(tp_group) -> tuple[int, int]:
 
 def _materialized_backward(ctx, grad_output: torch.Tensor):
     """Convert saved CE state to dlogits and form projection gradients."""
-    from liger_kernel.ops.vocab_parallel_cross_entropy import _get_num_warps
-    from liger_kernel.ops.vocab_parallel_cross_entropy import liger_vocab_parallel_ce_backward_kernel
-
     hidden, weight, exp_buf, sum_exp_global, target = ctx.saved_tensors
     grad_out = grad_output.contiguous().reshape(-1).float()
-    num_warps = _get_num_warps(ctx.ce_block_size)
-    liger_vocab_parallel_ce_backward_kernel[(hidden.shape[0],)](
-        EXP_ptr=exp_buf,
-        EXP_stride=exp_buf.stride(0),
-        sum_exp_ptr=sum_exp_global,
-        Y_ptr=target,
-        grad_out_ptr=grad_out,
-        vocab_start=ctx.vocab_start,
-        n_cols=weight.shape[0],
-        ignore_index=ctx.ignore_index,
-        alpha_eff=0.0,
-        eps_eff=0.0,
-        HAS_LABEL_SMOOTHING=False,
-        BLOCK_SIZE=ctx.ce_block_size,
-        num_warps=num_warps,
+    cutedsl_ce_backward(
+        exp_buf,
+        target,
+        sum_exp_global,
+        grad_out,
+        ctx.vocab_start,
+        ctx.ignore_index,
     )
 
     workspace = ctx.nvshmem_workspace
@@ -113,24 +100,7 @@ def _materialized_backward(ctx, grad_output: torch.Tensor):
             hidden.shape[0],
             hidden.shape[1],
         )
-        if grad_hidden_source.dtype == hidden.dtype:
-            if hidden.shape[0] <= 2048:
-                _cutile_dx_out(exp_buf, weight, grad_hidden_source)
-            else:
-                torch.mm(
-                    exp_buf,
-                    weight,
-                    out=grad_hidden_source,
-                )
-        elif _SUPPORTS_OUT_DTYPE:
-            torch.mm(
-                exp_buf,
-                weight,
-                out=grad_hidden_source,
-                out_dtype=torch.float32,
-            )
-        else:
-            grad_hidden_source.copy_(exp_buf.float() @ weight.float())
+        _matmul_out(exp_buf, weight, grad_hidden_source)
         workspace.dx_ready.record(torch.cuda.current_stream())
         workspace.overlap_stream.wait_event(workspace.dx_ready)
         with torch.cuda.stream(workspace.overlap_stream):
@@ -139,12 +109,11 @@ def _materialized_backward(ctx, grad_output: torch.Tensor):
         workspace.sum_reduce(grad_hidden_source, grad_hidden_destination)
         torch.cuda.current_stream().wait_stream(workspace.overlap_stream)
         grad_hidden = grad_hidden_destination
-    elif _SUPPORTS_OUT_DTYPE:
-        grad_hidden = torch.mm(exp_buf, weight, out_dtype=torch.float32)
-        grad_weight = exp_buf.t() @ hidden
-        grad_bias = exp_buf.sum(dim=0, dtype=torch.float32).to(ctx.bias_dtype) if ctx.has_bias else None
     else:
-        grad_hidden = exp_buf.float() @ weight.float()
+        if _SUPPORTS_OUT_DTYPE:
+            grad_hidden = torch.mm(exp_buf, weight, out_dtype=torch.float32)
+        else:
+            grad_hidden = exp_buf.float() @ weight.float()
         grad_weight = exp_buf.t() @ hidden
         grad_bias = exp_buf.sum(dim=0, dtype=torch.float32).to(ctx.bias_dtype) if ctx.has_bias else None
 
@@ -190,6 +159,12 @@ class LigerMegatronFusedLinearCrossEntropyFunction(torch.autograd.Function):
                 raise TypeError("bias must have the same device and dtype as hidden.")
         if hidden.device.type != "cuda" or hidden.dtype not in (torch.bfloat16, torch.float16):
             raise RuntimeError("Megatron FLCE requires a CUDA GPU and float16 or bfloat16 inputs.")
+        vocab_alignment = 16 // hidden.element_size()
+        if weight.shape[0] % vocab_alignment:
+            raise ValueError(
+                f"local vocabulary size must be divisible by {vocab_alignment} for aligned CuTe loads, "
+                f"got {weight.shape[0]}."
+            )
 
         tp_rank, tp_world = _tp_rank_and_world(tp_group)
         vocab_local = weight.shape[0]
@@ -210,38 +185,20 @@ class LigerMegatronFusedLinearCrossEntropyFunction(torch.autograd.Function):
         weight_2d = weight.contiguous()
         bias_1d = bias.contiguous() if bias is not None else None
 
-        logits = torch.mm(hidden_2d, weight_2d.t())
+        logits = _cutedsl_gemm(hidden_2d, weight_2d)
         if bias_1d is not None:
             logits.add_(bias_1d)
 
         if nvshmem_workspace is not None and tp_world > 1:
             logits_max_source, logits_max = nvshmem_workspace.max_buffers(hidden_2d.shape[0])
-            local_max_block = triton.next_power_of_2(vocab_local)
-            local_max_warps = 8 if local_max_block <= 8192 else 16
-            _local_logits_max_kernel[(hidden_2d.shape[0],)](
-                logits,
-                logits.stride(0),
-                logits_max_source,
-                vocab_local,
-                BLOCK_SIZE=local_max_block,
-                num_warps=local_max_warps,
-            )
+            cutedsl_row_max(logits, logits_max_source)
             nvshmem_workspace.max_reduce(logits_max_source, logits_max)
         else:
             logits_max = logits.amax(dim=-1).float()
         if nvshmem_workspace is None and tp_world > 1:
             dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
 
-        from liger_kernel.ops.vocab_parallel_cross_entropy import _get_num_warps
-        from liger_kernel.ops.vocab_parallel_cross_entropy import _select_block_size
-        from liger_kernel.ops.vocab_parallel_cross_entropy import liger_vocab_parallel_ce_forward_kernel
-
-        exp_buf = torch.empty(
-            hidden_2d.shape[0],
-            vocab_local,
-            device=hidden.device,
-            dtype=hidden.dtype,
-        )
+        exp_buf = logits
         if nvshmem_workspace is not None and tp_world > 1:
             predicted_logit, sum_exp, global_predicted_logit, global_sum_exp = nvshmem_workspace.stats_buffers(
                 hidden_2d.shape[0]
@@ -249,22 +206,14 @@ class LigerMegatronFusedLinearCrossEntropyFunction(torch.autograd.Function):
         else:
             predicted_logit = torch.empty(hidden_2d.shape[0], device=hidden.device, dtype=torch.float32)
             sum_exp = torch.empty_like(predicted_logit)
-        ce_block_size = _select_block_size(vocab_local)
-        num_warps = _get_num_warps(ce_block_size)
-        liger_vocab_parallel_ce_forward_kernel[(hidden_2d.shape[0],)](
-            X_ptr=logits,
-            X_stride=logits.stride(0),
-            EXP_ptr=exp_buf,
-            EXP_stride=exp_buf.stride(0),
-            logits_max_ptr=logits_max,
-            Y_ptr=flat_target,
-            pred_ptr=predicted_logit,
-            sum_exp_ptr=sum_exp,
-            vocab_start=vocab_start,
-            n_cols=vocab_local,
-            ignore_index=ignore_index,
-            BLOCK_SIZE=ce_block_size,
-            num_warps=num_warps,
+        cutedsl_ce_forward(
+            exp_buf,
+            flat_target,
+            logits_max,
+            predicted_logit,
+            sum_exp,
+            vocab_start,
+            ignore_index,
         )
         if nvshmem_workspace is not None and tp_world > 1:
             count = 2 * hidden_2d.shape[0]
@@ -278,8 +227,7 @@ class LigerMegatronFusedLinearCrossEntropyFunction(torch.autograd.Function):
             dist.all_reduce(predicted_logit, op=dist.ReduceOp.SUM, group=tp_group)
             dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
 
-        loss = torch.log(sum_exp) - predicted_logit
-        loss = torch.where(valid, loss, torch.zeros_like(loss))
+        loss = cutedsl_ce_loss(sum_exp, predicted_logit, flat_target, ignore_index)
 
         ctx.save_for_backward(hidden_2d, weight_2d, exp_buf, sum_exp, flat_target)
         ctx.has_bias = bias is not None
@@ -288,7 +236,6 @@ class LigerMegatronFusedLinearCrossEntropyFunction(torch.autograd.Function):
         ctx.tp_world = tp_world
         ctx.vocab_start = vocab_start
         ctx.ignore_index = ignore_index
-        ctx.ce_block_size = ce_block_size
         ctx.original_hidden_shape = original_hidden_shape
         ctx.hidden_dtype = hidden.dtype
         ctx.nvshmem_workspace = nvshmem_workspace
